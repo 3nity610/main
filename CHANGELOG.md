@@ -3,6 +3,35 @@
 ## 1.0.0 — Unreleased
 
 - chore(devx): retain proof artifacts in CI through a privacy-checked allowlist (#398)
+- Added the `redacted_ancestry` Noir circuit and helper (#356): proves a redacted
+  derivative descends from a committed parent evidence object without revealing
+  the unredacted parent hash, the redaction mask preimage, or credential secrets.
+  Binds the canonical lineage `redact` identifier and the `1..=4` depth bound,
+  with synthetic vectors and schema guards. See `docs/zk-redacted-ancestry-spec.md`.
+- External verifier verdicts are now enforced: registrations whose
+  `verify_external_proof` call fails (or that pass an empty proof) revert with
+  `InvalidProof` instead of proceeding silently.
+- Scoped `POST /api/proofs/register` auth to proof ownership: owner-bound bearer keys (`REGISTER_SCOPED_KEYS`, digests only) may register only their own `sourceAddress` and cannot take over another owner's proof; the legacy `REGISTER_API_KEY` is unchanged. Auth now runs before idempotency replay, and the registration route no longer crashes without a `timeAttestation`. See `docs/registration-auth-scoping.md`.
+- Made protocol-binding comparisons constant-time in the Python, browser, and Soroban verifier-input codecs and the `/metrics` token check. Reject codes, circuits, and artifacts are unchanged; see `docs/zk-conformance-vectors.md`.
+- Enforced configured CORS origins server-side in the Flask backend: requests
+  carrying an `Origin` outside `CORS_ORIGINS` are now rejected with a privacy-safe
+  `403 FORBIDDEN_ORIGIN` envelope before route handlers execute, closing the gap
+  where flask-cors only withheld `Access-Control-Allow-Origin` headers (#266).
+  Requests without an `Origin` header and the `/health`, `/ready`, and `/metrics`
+  paths are exempt; rejections are counted in admission-rejection metrics and the
+  origin value is never logged.
+- Published circuit artifact provenance (`zk/circuit.provenance.json`) with `write-provenance` / `verify-provenance` gates that bind lock-declared circuit sources without compiling ACIR (#376).
+- Added issuer trust-state badges to the verification portal and Evidence Studio. The frontend now reads `get_issuer` from the registry and resolves a record's issuer to one of nine stable states (`trusted`, `revoked`, `unknown`, `expired`, `unsupported`, `malformed`, `oversized`, `unavailable`, `checking`). Address shape is validated before any registry read, an unreadable registry is reported as `unavailable` rather than as `unknown`, and the badge surfaces only the issuer address already public on chain. See `frontend/src/provenance/issuerTrust.ts`.
+- Added fail-closed startup verification of applied migration checksums: `backend/migration.py` replays each recorded SHA-256 digest against its in-code definition and aborts startup with `MigrationChecksumError` on mismatch (id/digest-only reporting). `MIGRATION_CHECKSUM_ENFORCEMENT=warn` is the break-glass rollback. See `backend/README.md` and `THREAT_MODEL.md` (T10).
+- Added a fail-closed contract Wasm size budget (`MAX_WASM_SIZE_BYTES = 128_000`,
+  just under Soroban's 128 KiB upload cap, plus a minimum-size floor and 15%
+  regression band) enforced in Contracts CI against `devx/wasm_size_budget.json`,
+  with digest-recorded baselines and typed `WasmBudgetError` codes in
+  `contracts/harpocrates-registry/src/wasm_budget.rs` (#346).
+- Added independent on-chain timestamp claim anchoring (`anchor_timestamp_claim`,
+  `get_timestamp_claim`, `has_independent_timestamp_anchor`) so registry proofs can
+  bind off-chain time attestations to Stellar ledger time and optional RFC 3161
+  commitments without storing tokens or secrets. See `contracts/TIMESTAMP_CLAIMS.md`.
 - Added a dependency pin and lockfile gate (`devx/check_dependency_pins.py`, wired into the release gate): pip requirements must be exactly pinned, npm lockfiles must match their manifests, cargo locks must resolve every workspace dependency, and the Noir toolchain lock must pin concrete compiler versions. See `docs/dependency-pins.md`. Closes #391.
 - Domain-separated proof-cache keys in the backend verifier cache (#373): keys
   are SHA-256 digests over the versioned `harpocrates:verifier-cache:v1` domain
