@@ -255,13 +255,6 @@ and `metadata_hash` for content they did not actually review.
 | `register_seal` requires `issuer.require_auth()` — the issuer's Stellar keypair must sign | `lib.rs` → `register_seal` |
 | Typed `IssuerAdded` / `IssuerRevoked` events enable off-chain monitoring | `lib.rs` → event structs |
 
-**Control (#357):** The `revocation_witness` Merkle tree is protocol-bounded at
-`MAX_REVOCATION_WITNESS_DEPTH = 3` (`MAX_REVOCATION_LEAVES = 8`). The Noir
-circuit is fixed at this depth; host tooling (`zk/tools/revocation_depth.py`,
-verifier codec) rejects oversized depth before proving so hostile trees cannot
-inflate witness size or proving cost at this boundary. Depth changes require a
-new circuit version.
-
 **Residual risk:** Revocation is reactive, not proactive. Records registered
 before revocation remain `STATUS_REGISTERED` on-chain. The admin must manually
 call `revoke_proof` for each fraudulent record — there is no bulk revocation.
@@ -380,16 +373,11 @@ the NeonDB event log, or inject malicious data into the proof record.
 | `limit` parameter on `GET /api/proofs` is clamped to [1, 100] | `db.py` → `list_proof_events` |
 | Metrics endpoint is token-gated (`METRICS_TOKEN`) | `app.py` → `metrics` route |
 | Request IDs (`X-Request-ID`) enable per-request tracing | `app.py` → `start_request_context` |
-| Per-client rate limits on embed/extract/register/noir and upload-session create/chunk/commit, keyed on the real client IP | `app.py` → `@limiter.limit`, `config.py` |
-| `Retry-After` + `X-RateLimit-*` hints and a JSON `RATE_LIMITED` envelope carrying `request_id` | `app.py` → `rate_limit_exceeded` |
 
-**Residual risk:** Per-client rate limits are enforced per endpoint, but the
-default in-process store (`memory://`) is not shared across workers, so counters
-must be backed by a shared store in multi-worker or multi-replica deployments.
-`TRUSTED_PROXIES` must be configured behind a reverse proxy, otherwise every
-request keys on the proxy address. Video processing (ffmpeg frame pipeline) is
-still CPU and memory intensive; a few concurrent large-video requests can
-saturate a single worker.
+**Residual risk:** There is no rate limiting on any endpoint. A single IP can
+send an unlimited number of embed requests within the connection limit of the
+host. Video processing (ffmpeg frame pipeline) is CPU and memory intensive;
+even a few concurrent large-video requests can saturate the backend.
 `POST /api/proofs/register` has no authentication at all — any caller can insert
 arbitrary (but format-validated) rows into `proof_events`. This means NeonDB
 cannot be used as a trusted audit log for on-chain activity.
@@ -614,8 +602,6 @@ must be reconciled against on-chain data for any security-sensitive decision.
 | Dual-channel embedding (border + LSB) | T7 | `stego.py` → `embed_metadata` |
 | Quarantine directory and signature scanning (magic bytes) | T6 | `quarantine.py` → `isolate_upload`, `SignatureScanner` |
 | Sandboxed ffmpeg execution (resource profiles, timeouts, and sanitized errors) | T6 | `stego.py` → `_start_decode`, `_start_encode`, `_kill_after_timeout` |
-| AST-based API Schema generation prevents DB injections and application state side-effects during build/CI | T6, T10 | `devx/generate_api_schema.py` |
-| Domain-separated proof-cache keys: SHA-256 over versioned `harpocrates:verifier-cache:v1` tag + length-prefixed fields; hex canonicalization prevents case-variant cache fragmentation | T2, T8 | `verifier_cache.py` → `CACHE_KEY_DOMAIN_TAG`, `_get_cache_key` |
 
 
 ### 7.3 React Frontend
@@ -668,18 +654,17 @@ confirms a zero-length or trivially-constructed proof is rejected.
 
 ---
 
-### OR-2 Backend API Rate Limiting
+### OR-2 No Rate Limiting on Backend API
 
-**Severity:** Low (residual)  
+**Severity:** High  
 **Component:** Flask backend  
-**Description:** Per-client rate limits now guard the upload and proof endpoints
-via `flask-limiter`, keyed on the real client IP. The remaining risk is
-deployment shape: the default `memory://` store is per-process, so limits must
-be backed by a shared store (`RATELIMIT_STORAGE_URI`) when running more than one
-worker or replica.  
-**Remediation:** Configure `RATELIMIT_STORAGE_URI` (e.g. Redis) and
-`TRUSTED_PROXIES` for multi-worker deployments; consider a signed request token
-for embed operations.
+**Description:** All endpoints (`/api/stego/embed`, `/api/stego/extract`,
+`/api/proofs/register`) are unauthenticated and rate-unlimited. A single IP can
+submit thousands of requests and exhaust CPU (ffmpeg), memory, or the NeonDB
+connection pool.  
+**Remediation:** Add a reverse-proxy rate limit (nginx `limit_req`) or a
+Flask middleware (e.g., `flask-limiter`) keyed on IP address. Consider requiring
+a signed request token for embed operations.
 
 ---
 
@@ -837,70 +822,6 @@ The following are explicitly outside the scope of this threat model:
 
 ---
 
-
----
-
-## 9.1 Privacy-Safe Backend Trace Fields
-
-**Artifact:** `backend/trace_fields.py` (`harpocrates-trace-v1`)
-
-Backend request logs and `/health`/`/ready` responses may carry opaque
-correlation identifiers (`request_id`, `trace_id`, `span_id`,
-`correlation_id`) plus a sanitized `endpoint_pattern`.
-
-| Property | Guarantee |
-|----------|-----------|
-| Trust boundary | Public HTTP edge and structured logs only |
-| Allowed | Opaque IDs, W3C `traceparent` (v00), sanitized routes, versioned ID tags |
-| Forbidden | Media bytes, proofs, witness values, private keys, secrets, raw IPs, raw User-Agent |
-| Malformed / oversized headers | Ignored; generated opaque IDs substituted |
-| Cross-origin propagation | `http_security.CORS_ALLOW_HEADERS` accepts the trace headers; `CORS_EXPOSE_HEADERS` lets browser clients read the echoed IDs |
-| Migration | Additive; existing `request_id` header/log field retained |
-| Rollback | Stop emitting extended fields; callers keep `request_id` |
-
-## 9.2 Per-Client Upload Rate Limits
-
-**Artifact:** `backend/app.py`, `backend/config.py` (flask-limiter)
-
-Per-client rate limits are enforced at the Flask request boundary for the
-upload and proof endpoints.
-
-| Property | Guarantee |
-|----------|-----------|
-| Trust boundary | Public HTTP edge; key is the real client IP, never raw forwarded headers |
-| Default windows | embed/extract/register 30/min, silent-witness 20/min, upload-session 60/min, chunk 240/min |
-| Failure response | Stable JSON `RATE_LIMITED` envelope with `request_id`; `Retry-After` + `X-RateLimit-*` headers |
-| Privacy | Counters and logs never include media bytes, witness values, secrets, or raw forwarded headers |
-| Malformed input | Oversized/unknown paths still counted per client; spoofed `X-Forwarded-For` ignored unless the peer is a trusted proxy |
-| Migration | Additive; `RATELIMIT_ENABLED=false` disables the layer without changing routes |
-| Rollback | Remove `@limiter.limit` decorators; endpoints behave as before |
-
-## 9.3 C2PA Authenticity Assertion Export
-
-**Artifact:** `cli/src/c2pa.ts` (`harpocrates c2pa`), schema version 1,
-exporter `harpocrates-cli/c2pa` v1.0.0.
-
-`harpocrates c2pa` derives C2PA authenticity assertions from the canonical
-proof manifest and (optionally) a verification receipt. It produces an
-**unsigned** C2PA JSON manifest definition; downstream tooling signs it with
-its own C2PA signer and key material.
-
-| Property | Guarantee |
-|----------|-----------|
-| Trust boundary | Local output byte stream; the caller's C2PA signer and the target media platform become the consumers |
-| Single truth | All values come from the canonical manifest/receipt schemas; `manifestHash` = SHA-256 of the canonical serialized manifest, so the export cannot drift into a second metadata truth |
-| Privacy | Only public manifest/registry fields are emitted; media bytes, witness values, credential secrets, proof bytes, transaction blobs, and signing keys are never emitted, and the exporter never signs |
-| Verification honesty | `harpocrates.verification.v1` records the receipt outcome verbatim (`valid`/`expired`/`revoked`/`not_found`/`pending`/`failed`/...); a `valid` status is never fabricated |
-| Determinism | Same manifest + receipt ⇒ identical output bytes (CI-verified against `devx/fixtures/c2pa/expected-export.json`) |
-| Input guards | Manifest/receipt capped at 1 MiB input, 256 KiB output; unknown manifest fields and unsupported versions rejected with fixed, privacy-safe errors (exit 8) |
-| Migration | Additive; schema version `1` carried in the export, no on-chain or metadata schema change |
-| Rollback | Deploy the prior CLI build; existing receipt shape and exit-code mapping unchanged |
-
-For upstream threat coverage, the export output sits at TB-2 (browser/user →
-Stellar RPC) and TB-1 (local tooling boundary): it publishes hashes and
-registry identity that are public after registration, and it never accesses
-A1/A2 (credential/nullifier secrets) or A8/A9 keypairs.
-
 ## 10. Review and Update Cadence
 
 | Trigger | Action |
@@ -911,7 +832,6 @@ A1/A2 (credential/nullifier secrets) or A8/A9 keypairs.
 | New backend endpoint or authentication change | Re-review T1, T6, T10. |
 | Admin key rotation | Update D3; verify two-step transfer completed cleanly. |
 | Any new npm or Python dependency with network access | Assess supply-chain risk (T4). |
-| Any change to the CLI C2PA exporter (`cli/src/c2pa.ts`, `harpocrates c2pa`) | Re-review Section 9.3; regenerate the committed fixture. |
 | Scheduled review | Every six months from the date of last update, regardless of changes. |
 
 When updating this document, increment the version number, update the date, and
@@ -921,8 +841,3 @@ add a one-line change summary below:
 |---------|------|---------|
 | 1.0 | 2026-07-24 | Initial threat model. Covers all four components. Nine open risks identified. |
 | 1.1 | 2026-07-26 | Add OR-10: Threshold seal policy governance (m-of-n Public Seal). |
-| 1.2 | 2026-09-24 | Document privacy-safe backend trace fields (`harpocrates-trace-v1`). |
-| 1.3 | 2026-09-24 | Expose/allowed propagation headers through the CORS policy. |
-
-## CI proof artifact retention
-Retained CI artifacts are a public-boundary risk. Only allowlisted proof outputs are retained, via `devx/retain_proof_artifacts.py`, which rejects media, keys, seeds, witness values and prover inputs, and never prints file names or contents. See `docs/proof-artifact-retention.md`.
